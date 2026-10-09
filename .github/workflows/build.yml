@@ -1,0 +1,470 @@
+name: Build APK
+on: workflow_dispatch
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+      - name: Write project files
+        run: |
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "GalleryShorts"
+          include(":app")
+          EOF
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+          cat > gradle.properties <<'EOF'
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx3g
+          EOF
+          mkdir -p app
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.example.galleryshorts"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.galleryshorts"
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          dependencies {
+              implementation("androidx.viewpager2:viewpager2:1.1.0")
+          }
+          EOF
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
+              <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
+              <application
+                  android:label="Ø´ÙˆØ±Øª Ú¯Ø§Ù„Ø±ÛŒ"
+                  android:allowBackup="false"
+                  android:theme="@android:style/Theme.Material.NoActionBar.Fullscreen">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:screenOrientation="portrait">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+          mkdir -p app/src/main/java/com/example/galleryshorts
+          cat > app/src/main/java/com/example/galleryshorts/MainActivity.kt <<'EOF'
+          package com.example.galleryshorts
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.ContentUris
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.graphics.Color
+          import android.graphics.drawable.GradientDrawable
+          import android.media.MediaPlayer
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
+          import android.provider.MediaStore
+          import android.provider.Settings
+          import android.util.TypedValue
+          import android.view.Gravity
+          import android.view.View
+          import android.view.ViewGroup
+          import android.view.WindowManager
+          import android.widget.Button
+          import android.widget.FrameLayout
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import android.widget.VideoView
+          import androidx.recyclerview.widget.RecyclerView
+          import androidx.viewpager2.widget.ViewPager2
+          import java.text.NumberFormat
+          import java.util.Locale
+
+          data class Item(val id: Long, val name: String, val uri: Uri)
+
+          object State {
+              var muted = false
+              val liked = HashSet<Long>()
+          }
+
+          fun Context.dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+
+          fun Context.roundButton(label: String): TextView = TextView(this).apply {
+              text = label
+              setTextColor(Color.WHITE)
+              setTextSize(TypedValue.COMPLEX_UNIT_SP, 22f)
+              gravity = Gravity.CENTER
+              background = GradientDrawable().apply {
+                  shape = GradientDrawable.OVAL
+                  setColor(0x66000000)
+              }
+          }
+
+          class VideoPage(ctx: Context) : FrameLayout(ctx) {
+              private val video = VideoView(ctx)
+              private val title = TextView(ctx)
+              private val pauseIcon = TextView(ctx)
+              private val fill = View(ctx)
+              private val likeBtn = ctx.roundButton("â™¡")
+              private val muteBtn = ctx.roundButton("ðŸ”Š")
+              private val ui = Handler(Looper.getMainLooper())
+              private var item: Item? = null
+              private var mp: MediaPlayer? = null
+              private var loaded = false
+              private var prepared = false
+              private var active = false
+
+              private val tick = object : Runnable {
+                  override fun run() {
+                      val d = video.duration
+                      if (prepared && d > 0) fill.scaleX = video.currentPosition.toFloat() / d
+                      ui.postDelayed(this, 150)
+                  }
+              }
+
+              init {
+                  layoutDirection = View.LAYOUT_DIRECTION_LTR
+                  setBackgroundColor(Color.BLACK)
+                  addView(video, FrameLayout.LayoutParams(-1, -1, Gravity.CENTER))
+
+                  title.setTextColor(Color.WHITE)
+                  title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
+                  title.maxLines = 2
+                  title.setShadowLayer(6f, 0f, 1f, Color.BLACK)
+                  addView(title, FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM).apply {
+                      leftMargin = ctx.dp(16); rightMargin = ctx.dp(80); bottomMargin = ctx.dp(28)
+                  })
+
+                  val rail = LinearLayout(ctx)
+                  rail.orientation = LinearLayout.VERTICAL
+                  rail.addView(likeBtn, LinearLayout.LayoutParams(ctx.dp(48), ctx.dp(48)))
+                  rail.addView(muteBtn, LinearLayout.LayoutParams(ctx.dp(48), ctx.dp(48)).apply { topMargin = ctx.dp(12) })
+                  addView(rail, FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.RIGHT).apply {
+                      rightMargin = ctx.dp(12); bottomMargin = ctx.dp(28)
+                  })
+
+                  pauseIcon.text = "â–¶"
+                  pauseIcon.setTextColor(0xCCFFFFFF.toInt())
+                  pauseIcon.setTextSize(TypedValue.COMPLEX_UNIT_SP, 56f)
+                  pauseIcon.visibility = View.GONE
+                  addView(pauseIcon, FrameLayout.LayoutParams(-2, -2, Gravity.CENTER))
+
+                  val track = View(ctx)
+                  track.setBackgroundColor(0x33FFFFFF)
+                  addView(track, FrameLayout.LayoutParams(-1, ctx.dp(3), Gravity.BOTTOM))
+                  fill.setBackgroundColor(0xFFFFB703.toInt())
+                  fill.pivotX = 0f
+                  fill.scaleX = 0f
+                  addView(fill, FrameLayout.LayoutParams(-1, ctx.dp(3), Gravity.BOTTOM))
+
+                  video.setOnPreparedListener { m ->
+                      mp = m
+                      prepared = true
+                      m.isLooping = true
+                      applyVolume()
+                      if (active) startPlay()
+                  }
+                  video.setOnErrorListener { _, _, _ -> true }
+
+                  setOnClickListener {
+                      if (!prepared) return@setOnClickListener
+                      if (video.isPlaying) {
+                          video.pause()
+                          pauseIcon.visibility = View.VISIBLE
+                      } else {
+                          startPlay()
+                      }
+                  }
+                  likeBtn.setOnClickListener {
+                      val cur = item ?: return@setOnClickListener
+                      if (!State.liked.remove(cur.id)) State.liked.add(cur.id)
+                      refreshButtons()
+                  }
+                  muteBtn.setOnClickListener {
+                      State.muted = !State.muted
+                      applyVolume()
+                      refreshButtons()
+                  }
+              }
+
+              private fun refreshButtons() {
+                  val cur = item
+                  val liked = cur != null && State.liked.contains(cur.id)
+                  likeBtn.text = if (liked) "â™¥" else "â™¡"
+                  likeBtn.setTextColor(if (liked) 0xFFFFB703.toInt() else Color.WHITE)
+                  muteBtn.text = if (State.muted) "ðŸ”‡" else "ðŸ”Š"
+              }
+
+              private fun applyVolume() {
+                  val v = if (State.muted) 0f else 1f
+                  mp?.setVolume(v, v)
+              }
+
+              fun bind(data: Item, isActive: Boolean) {
+                  item = data
+                  prepared = false
+                  active = isActive
+                  fill.scaleX = 0f
+                  pauseIcon.visibility = View.GONE
+                  title.text = data.name.substringBeforeLast('.')
+                  refreshButtons()
+                  loaded = true
+                  video.setVideoURI(data.uri)
+              }
+
+              fun attach() {
+                  val data = item ?: return
+                  if (!loaded) {
+                      prepared = false
+                      loaded = true
+                      video.setVideoURI(data.uri)
+                  }
+              }
+
+              fun detach() {
+                  ui.removeCallbacks(tick)
+                  video.stopPlayback()
+                  loaded = false
+                  prepared = false
+              }
+
+              fun setActive(a: Boolean) {
+                  if (a) play() else pause(true)
+              }
+
+              fun play() {
+                  active = true
+                  if (prepared) startPlay()
+              }
+
+              fun pause(rewind: Boolean) {
+                  active = false
+                  ui.removeCallbacks(tick)
+                  if (prepared) {
+                      if (video.isPlaying) video.pause()
+                      if (rewind) video.seekTo(0)
+                  }
+              }
+
+              private fun startPlay() {
+                  pauseIcon.visibility = View.GONE
+                  applyVolume()
+                  video.start()
+                  ui.removeCallbacks(tick)
+                  ui.post(tick)
+              }
+          }
+
+          class VH(val page: VideoPage) : RecyclerView.ViewHolder(page)
+
+          class VideoAdapter(val items: MutableList<Item>) : RecyclerView.Adapter<VH>() {
+              var current = 0
+              val attached = HashSet<VH>()
+
+              override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): VH {
+                  val page = VideoPage(parent.context)
+                  page.layoutParams = ViewGroup.LayoutParams(
+                      ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT
+                  )
+                  return VH(page)
+              }
+
+              override fun onBindViewHolder(holder: VH, position: Int) {
+                  holder.page.bind(items[position], position == current)
+              }
+
+              override fun getItemCount(): Int = items.size
+
+              override fun onViewAttachedToWindow(holder: VH) {
+                  super.onViewAttachedToWindow(holder)
+                  attached.add(holder)
+                  holder.page.attach()
+                  if (holder.adapterPosition == current) holder.page.play()
+              }
+
+              override fun onViewDetachedFromWindow(holder: VH) {
+                  super.onViewDetachedFromWindow(holder)
+                  attached.remove(holder)
+                  holder.page.detach()
+              }
+
+              fun select(pos: Int) {
+                  current = pos
+                  for (h in attached) h.page.setActive(h.adapterPosition == pos)
+              }
+          }
+
+          class MainActivity : Activity() {
+              private lateinit var root: FrameLayout
+              private lateinit var counter: TextView
+              private lateinit var shuffleBtn: TextView
+              private lateinit var msg: LinearLayout
+              private lateinit var msgText: TextView
+              private lateinit var msgBtn: Button
+              private var pager: ViewPager2? = null
+              private var videoAdapter: VideoAdapter? = null
+              private var asked = false
+              private val nf = NumberFormat.getInstance(Locale("fa", "IR"))
+
+              private fun perm(): String =
+                  if (Build.VERSION.SDK_INT >= 33) Manifest.permission.READ_MEDIA_VIDEO
+                  else Manifest.permission.READ_EXTERNAL_STORAGE
+
+              private fun hasPerm(): Boolean =
+                  checkSelfPermission(perm()) == PackageManager.PERMISSION_GRANTED
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+
+                  root = FrameLayout(this)
+                  root.setBackgroundColor(Color.BLACK)
+                  root.layoutDirection = View.LAYOUT_DIRECTION_LTR
+                  setContentView(root)
+
+                  counter = TextView(this)
+                  counter.setTextColor(Color.WHITE)
+                  counter.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+                  counter.setPadding(dp(14), dp(6), dp(14), dp(6))
+                  counter.visibility = View.GONE
+                  counter.background = GradientDrawable().apply {
+                      cornerRadius = dp(20).toFloat()
+                      setColor(0x66000000)
+                  }
+                  root.addView(counter, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.LEFT).apply {
+                      topMargin = dp(24); leftMargin = dp(14)
+                  })
+
+                  shuffleBtn = roundButton("ðŸ”€")
+                  shuffleBtn.visibility = View.GONE
+                  root.addView(shuffleBtn, FrameLayout.LayoutParams(dp(44), dp(44), Gravity.TOP or Gravity.RIGHT).apply {
+                      topMargin = dp(20); rightMargin = dp(12)
+                  })
+                  shuffleBtn.setOnClickListener {
+                      val a = videoAdapter ?: return@setOnClickListener
+                      a.items.shuffle()
+                      a.current = 0
+                      a.notifyDataSetChanged()
+                      pager?.setCurrentItem(0, false)
+                      updateCounter(0)
+                  }
+
+                  msgText = TextView(this)
+                  msgText.setTextColor(Color.WHITE)
+                  msgText.setTextSize(TypedValue.COMPLEX_UNIT_SP, 18f)
+                  msgText.gravity = Gravity.CENTER
+                  msgBtn = Button(this)
+                  msgBtn.text = "Ø§Ø¬Ø§Ø²Ù‡ Ø¯Ø§Ø¯Ù†"
+                  msg = LinearLayout(this)
+                  msg.orientation = LinearLayout.VERTICAL
+                  msg.gravity = Gravity.CENTER
+                  msg.setPadding(dp(32), dp(32), dp(32), dp(32))
+                  msg.addView(msgText)
+                  msg.addView(msgBtn, LinearLayout.LayoutParams(-2, -2).apply { topMargin = dp(20) })
+                  root.addView(msg, FrameLayout.LayoutParams(-1, -1))
+                  msg.visibility = View.GONE
+                  msgBtn.setOnClickListener {
+                      if (!asked || shouldShowRequestPermissionRationale(perm())) {
+                          asked = true
+                          requestPermissions(arrayOf(perm()), 1)
+                      } else {
+                          startActivity(
+                              Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$packageName"))
+                          )
+                      }
+                  }
+
+                  if (hasPerm()) {
+                      start()
+                  } else {
+                      asked = true
+                      showMessage("Ø¨Ø±Ø§ÛŒ Ù†Ù…Ø§ÛŒØ´ ÙˆÛŒØ¯ÛŒÙˆÙ‡Ø§ÛŒ Ú¯Ø§Ù„Ø±ÛŒ Ø¨Ù‡ Ø§Ø¬Ø§Ø²Ù‡Ù” Ø¯Ø³ØªØ±Ø³ÛŒ Ù†ÛŒØ§Ø² Ø¯Ø§Ø±Ù….", true)
+                      requestPermissions(arrayOf(perm()), 1)
+                  }
+              }
+
+              override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+                  super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+                  if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                      start()
+                  } else {
+                      showMessage("Ø¨Ø¯ÙˆÙ† Ø§Ø¬Ø§Ø²Ù‡Ù” Ø¯Ø³ØªØ±Ø³ÛŒ Ø¨Ù‡ Ú¯Ø§Ù„Ø±ÛŒ Ù†Ù…ÛŒâ€ŒØªÙˆØ§Ù†Ù… ÙˆÛŒØ¯ÛŒÙˆÙ‡Ø§ Ø±Ø§ Ù†Ø´Ø§Ù† Ø¨Ø¯Ù‡Ù….", true)
+                  }
+              }
+
+              private fun showMessage(text: String, withButton: Boolean) {
+                  msgText.text = text
+                  msgBtn.visibility = if (withButton) View.VISIBLE else View.GONE
+                  msg.visibility = View.VISIBLE
+              }
+
+              private fun loadVideos(): MutableList<Item> {
+                  val out = mutableListOf<Item>()
+                  val base = MediaStore.Video.Media.EXTERNAL_CONTENT_URI
+                  val proj = arrayOf(MediaStore.Video.Media._ID, MediaStore.Video.Media.DISPLAY_NAME)
+                  contentResolver.query(base, proj, null, null, MediaStore.Video.Media.DATE_ADDED + " DESC")?.use { c ->
+                      val idCol = c.getColumnIndexOrThrow(MediaStore.Video.Media._ID)
+                      val nameCol = c.getColumnIndexOrThrow(MediaStore.Video.Media.DISPLAY_NAME)
+                      while (c.moveToNext()) {
+                          val id = c.getLong(idCol)
+                          val name = c.getString(nameCol) ?: ""
+                          out.add(Item(id, name, ContentUris.withAppendedId(base, id)))
+                      }
+                  }
+                  return out
+              }
+
+              private fun start() {
+                  if (videoAdapter != null) return
+                  val items = loadVideos()
+                  if (items.isEmpty()) {
+                      showMessage("ÙˆÛŒØ¯ÛŒÙˆÛŒÛŒ Ø¯Ø± Ú¯Ø§Ù„Ø±ÛŒ Ù¾ÛŒØ¯Ø§ Ù†Ø´Ø¯.", false)
+                      return
+                  }
+                  msg.visibility = View.GONE
+                  val ad = VideoAdapter(items)
+                  videoAdapter = ad
+                  val p = ViewPager2(this)
+                  p.orientation = ViewPager2.ORIENTATION_VERTICAL
+                  p.offscreenPageLimit = 1
+                  p.adapter = ad
+                  p.registerOnPageChangeCallback(object : ViewPager2.OnPageChangeCallback() {
+                      override fun onPageSelected(position: Int) {
+                          ad.select(position)
+                          updateCounter(position)
+                      }
+                  })
+                  pager = p
+                  roo
